@@ -1,0 +1,157 @@
+//@version=6
+indicator("4H Confirmed Structure Bias [No Backplot]", shorttitle = "4H Structure", overlay = true,
+     max_labels_count = 500, max_lines_count = 10)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════
+string GRP_S = "Structure"
+string htfTf     = input.timeframe("240", "Structure Timeframe", group = GRP_S)
+int    leftBars  = input.int(5, "Pivot Left Bars",  minval = 1, group = GRP_S)
+int    rightBars = input.int(5, "Pivot Right Bars", minval = 1, group = GRP_S)
+int    tolTicks  = input.int(2, "Equal-Level Tolerance (ticks)", minval = 0, group = GRP_S)
+
+string GRP_D = "Display"
+bool showSwings = input.bool(true, "Show 4H Swing Labels",        group = GRP_D)
+bool showBias   = input.bool(true, "Show 4H Bias Label",          group = GRP_D)
+bool showLevels = input.bool(true, "Show Active 4H High/Low",     group = GRP_D)
+int  rightPad   = input.int(8, "Right-Edge Label Offset (bars)", minval = 1, group = GRP_D)
+
+string GRP_C = "Colors"
+color bullCol = input.color(color.teal,   "Bullish",  group = GRP_C)
+color bearCol = input.color(color.maroon, "Bearish",  group = GRP_C)
+color neutCol = input.color(color.gray,   "Neutral",  group = GRP_C)
+color hiCol   = input.color(color.new(color.red, 0),   "Active 4H High Line", group = GRP_C)
+color loCol   = input.color(color.new(color.green, 0), "Active 4H Low Line",  group = GRP_C)
+
+// Guard: this tool is meant for charts on or below the structure timeframe
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(htfTf)
+    runtime.error("Chart timeframe must be ≤ the structure timeframe (" + htfTf + ").")
+
+// ═══════════════════════════════════════════════════════════════════════
+// 4H STRUCTURE ENGINE (runs in the 4H context)
+// State codes: 1 = HH/HL, -1 = LH/LL, 2 = EQH/EQL, 0 = none yet
+// Bias codes : 1 = BULLISH, -1 = BEARISH, 0 = NEUTRAL / TRANSITION
+// ═══════════════════════════════════════════════════════════════════════
+f_structure() =>
+    float tol = tolTicks * syminfo.mintick
+    float ph  = ta.pivothigh(high, leftBars, rightBars)
+    float pl  = ta.pivotlow(low,  leftBars, rightBars)
+
+    var float lastH  = na
+    var float prevH  = na
+    var int   lastHT = na
+    var int   hState = 0
+    var int   hId    = 0
+
+    var float lastL  = na
+    var float prevL  = na
+    var int   lastLT = na
+    var int   lState = 0
+    var int   lId    = 0
+
+    // New confirmed swing high
+    if not na(ph)
+        prevH  := lastH
+        lastH  := ph
+        lastHT := time[rightBars]                 // open time of the pivot 4H candle
+        hState := na(prevH) ? 0 : ph > prevH + tol ? 1 : ph < prevH - tol ? -1 : 2
+        hId    += 1
+
+    // New confirmed swing low
+    if not na(pl)
+        prevL  := lastL
+        lastL  := pl
+        lastLT := time[rightBars]
+        lState := na(prevL) ? 0 : pl > prevL + tol ? 1 : pl < prevL - tol ? -1 : 2
+        lId    += 1
+
+    // Bias: needs BOTH legs to agree; anything else = neutral/transition
+    int bias = hState == 1 and lState == 1 ? 1 : hState == -1 and lState == -1 ? -1 : 0
+
+    // Every value is offset by [1] → only fully CLOSED 4H bars are returned
+    [lastH[1], lastHT[1], hState[1], hId[1], lastL[1], lastLT[1], lState[1], lId[1], bias[1]]
+
+// gaps_off + lookahead_on + [1] = standard non-repainting MTF pattern
+[hP, hT, hS, hId, lP, lT, lS, lId, bias] = request.security(syminfo.tickerid, htfTf, f_structure(),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════════════════════════════
+// NEW-SWING EVENTS (detected once on the lower timeframe)
+// ═══════════════════════════════════════════════════════════════════════
+bool newHigh = nz(hId) > 0 and nz(hId) != nz(hId[1])
+bool newLow  = nz(lId) > 0 and nz(lId) != nz(lId[1])
+
+// ═══════════════════════════════════════════════════════════════════════
+// SWING LABELS (only at confirmation, compact)
+// Anchored at the pivot 4H candle's open time, above highs / below lows
+// ═══════════════════════════════════════════════════════════════════════
+if showSwings and newHigh and hS != 0
+    string txt = hS == 1 ? "4H HH" : hS == -1 ? "4H LH" : "4H EQH"
+    color  c   = hS == 1 ? bullCol : hS == -1 ? bearCol : neutCol
+    label.new(hT, hP, txt, xloc = xloc.bar_time, style = label.style_label_down,
+         color = c, textcolor = color.white, size = size.tiny,
+         tooltip = "4H swing high " + str.tostring(hP, format.mintick) +
+                   "\nPivot: " + str.format_time(hT, "yyyy-MM-dd HH:mm") +
+                   "\nConfirmed: " + str.format_time(time, "yyyy-MM-dd HH:mm"))
+
+if showSwings and newLow and lS != 0
+    string txt = lS == 1 ? "4H HL" : lS == -1 ? "4H LL" : "4H EQL"
+    color  c   = lS == 1 ? bullCol : lS == -1 ? bearCol : neutCol
+    label.new(lT, lP, txt, xloc = xloc.bar_time, style = label.style_label_up,
+         color = c, textcolor = color.white, size = size.tiny,
+         tooltip = "4H swing low " + str.tostring(lP, format.mintick) +
+                   "\nPivot: " + str.format_time(lT, "yyyy-MM-dd HH:mm") +
+                   "\nConfirmed: " + str.format_time(time, "yyyy-MM-dd HH:mm"))
+
+// ═══════════════════════════════════════════════════════════════════════
+// ACTIVE 4H HIGH / LOW — exactly two reusable rays (no steplines)
+// ═══════════════════════════════════════════════════════════════════════
+var line  hiLine = na
+var line  loLine = na
+var label hiTag  = na
+var label loTag  = na
+
+if showLevels and barstate.islast
+    if not na(hP)
+        if na(hiLine)
+            hiLine := line.new(hT, hP, time, hP, xloc = xloc.bar_time, extend = extend.right,
+                 color = hiCol, width = 1, style = line.style_dashed)
+            hiTag  := label.new(bar_index + rightPad, hP, "", style = label.style_label_left,
+                 color = color.new(hiCol, 80), textcolor = hiCol, size = size.tiny)
+        line.set_xy1(hiLine, hT, hP)
+        line.set_xy2(hiLine, time, hP)
+        label.set_xy(hiTag, bar_index + rightPad, hP)
+        label.set_text(hiTag, "4H High " + str.tostring(hP, format.mintick))
+    if not na(lP)
+        if na(loLine)
+            loLine := line.new(lT, lP, time, lP, xloc = xloc.bar_time, extend = extend.right,
+                 color = loCol, width = 1, style = line.style_dashed)
+            loTag  := label.new(bar_index + rightPad, lP, "", style = label.style_label_left,
+                 color = color.new(loCol, 80), textcolor = loCol, size = size.tiny)
+        line.set_xy1(loLine, lT, lP)
+        line.set_xy2(loLine, time, lP)
+        label.set_xy(loTag, bar_index + rightPad, lP)
+        label.set_text(loTag, "4H Low " + str.tostring(lP, format.mintick))
+
+// ═══════════════════════════════════════════════════════════════════════
+// FLOATING BIAS LABEL — pinned to the right of live price
+// ═══════════════════════════════════════════════════════════════════════
+var label biasLbl = na
+
+if showBias and barstate.islast
+    string bTxt = bias == 1 ? "[4H BIAS: BULLISH]" : bias == -1 ? "[4H BIAS: BEARISH]" : "[4H BIAS: NEUTRAL]"
+    color  bCol = bias == 1 ? bullCol : bias == -1 ? bearCol : neutCol
+    if na(biasLbl)
+        biasLbl := label.new(bar_index + rightPad, close, bTxt, style = label.style_label_left,
+             color = bCol, textcolor = color.white, size = size.small)
+    label.set_xy(biasLbl, bar_index + rightPad, close)
+    label.set_text(biasLbl, bTxt)
+    label.set_color(biasLbl, bCol)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS (fire on confirmed 4H data only)
+// ═══════════════════════════════════════════════════════════════════════
+alertcondition(bias == 1  and nz(bias[1]) != 1,  "4H Bias → Bullish", "4H bias turned BULLISH")
+alertcondition(bias == -1 and nz(bias[1]) != -1, "4H Bias → Bearish", "4H bias turned BEARISH")
+alertcondition(newHigh or newLow, "New 4H Swing", "New confirmed 4H swing")
