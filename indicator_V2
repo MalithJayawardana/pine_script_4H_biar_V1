@@ -1,0 +1,286 @@
+//@version=6
+indicator("MTF Confirmed Structure Bias [No Backplot]", shorttitle = "MTF Structure",
+     overlay = true, max_labels_count = 500, max_lines_count = 10)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════
+string GRP_S = "Structure"
+int    tolTicks = input.int(2, "Equal-Level Tolerance (ticks)", minval = 0, group = GRP_S)
+
+string GRP_B = "Bias Invalidation"
+bool   useInv = input.bool(true, "Close-Confirmed Bias Invalidation", group = GRP_B)
+
+string GRP_D = "Display"
+inputTF  = input.string("4H", "Chart Structure Timeframe", options = ["4H", "1H", "15m", "5m"], group = GRP_D)
+bool     showSwings = input.bool(true,  "Show Structure Labels",          group = GRP_D)
+bool     showLevels = input.bool(true,  "Show Active High/Low Lines",    group = GRP_D)
+bool     showBias    = input.bool(true,  "Show Bias Dashboard",          group = GRP_D)
+bool     bgShade    = input.bool(false, "Shade Background by Selected Bias", group = GRP_D)
+int      labelCap   = input.int(200, "Label History Limit", minval = 50, group = GRP_D)
+
+string GRP_T = "Dashboard"
+posSel     = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"], group = GRP_T)
+txtSizeIn  = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = GRP_T)
+
+string GRP_C = "Colors"
+color bullCol  = input.color(color.teal,   "Bullish",  group = GRP_C)
+color bearCol  = input.color(color.maroon, "Bearish",  group = GRP_C)
+color neutCol  = input.color(color.gray,   "Neutral",  group = GRP_C)
+color hiLineCol = input.color(color.new(color.red,   0), "Active High Line", group = GRP_C)
+color loLineCol = input.color(color.new(color.green, 0), "Active Low Line",  group = GRP_C)
+
+string GRP_P = "Per-Timeframe Pivot Settings"
+int left4  = input.int(2, "4H  Left Bars", minval = 1, group = GRP_P)
+int right4 = input.int(2, "4H  Right Bars", minval = 1, group = GRP_P)
+int left1  = input.int(2, "1H  Left Bars", minval = 1, group = GRP_P)
+int right1 = input.int(2, "1H  Right Bars", minval = 1, group = GRP_P)
+int left15 = input.int(2, "15m Left Bars", minval = 1, group = GRP_P)
+int right15= input.int(2, "15m Right Bars", minval = 1, group = GRP_P)
+int left5  = input.int(2, "5m  Left Bars", minval = 1, group = GRP_P)
+int right5 = input.int(2, "5m  Right Bars", minval = 1, group = GRP_P)
+
+// ═══════════════════════════════════════════════════════════════════════
+// LOWER-TIMEFRAME SAFETY
+// ═══════════════════════════════════════════════════════════════════════
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds("5")
+    runtime.error("This version must be used on a 5-minute or lower standard time-based chart. " +
+         "On higher timeframes, 5m/15m request.security() would silently consume lower-timeframe " +
+         "data as if it were higher-timeframe data, which breaks the non-repainting guarantee.")
+
+// ═══════════════════════════════════════════════════════════════════════
+// DASHBOARD SETUP (one table, reused every bar)
+// ═══════════════════════════════════════════════════════════════════════
+color bgDark = color.new(color.black, 20)
+int   txtSize = txtSizeIn == "Tiny" ? size.tiny : txtSizeIn == "Small" ? size.small : txtSizeIn == "Normal" ? size.normal : size.large
+
+var table dash = table.new(posSel == "Top Right" ? position.top_right : posSel == "Top Left" ? position.top_left : posSel == "Bottom Right" ? position.bottom_right : posSel == "Bottom Left" ? position.bottom_left : posSel == "Middle Right" ? position.middle_right : position.middle_left,
+     3, 5, bgcolor = bgDark, border_width = 1, border_color = color.new(color.gray, 60))
+
+var label[] labelPool = array.new_label()
+int   nTF = 0
+string[] tfNames = array.from("4H", "1H", "15m", "5m")
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRUCTURE ENGINE (shared function, runs in each timeframe's own context)
+// State codes: 1 = HH/HL, -1 = LH/LL, 2 = EQH/EQL, 0 = none yet
+// Bias codes : 1 = BULLISH, -1 = BEARISH, 0 = NEUTRAL / TRANSITION, 99 = WAIT
+// ═══════════════════════════════════════════════════════════════════════
+f_structure(int leftBars, int rightBars) =>
+    float tol = tolTicks * syminfo.mintick
+    float ph  = ta.pivothigh(high, leftBars, rightBars)
+    float pl  = ta.pivotlow(low,  leftBars, rightBars)
+
+    var float lastH  = na
+    var float prevH  = na
+    var int   lastHT = na
+    var int   hState = 0
+    var int   hId    = 0
+
+    var float lastL  = na
+    var float prevL  = na
+    var int   lastLT = na
+    var int   lState = 0
+    var int   lId    = 0
+
+    if not na(ph)
+        prevH  := lastH
+        lastH  := ph
+        lastHT := time[rightBars]
+        hState := na(prevH) ? 0 : ph > prevH + tol ? 1 : ph < prevH - tol ? -1 : 2
+        hId    += 1
+
+    if not na(pl)
+        prevL  := lastL
+        lastL  := pl
+        lastLT := time[rightBars]
+        lState := na(prevL) ? 0 : pl > prevL + tol ? 1 : pl < prevL - tol ? -1 : 2
+        lId    += 1
+
+    // ═════════════════════════════════════════════════════════════════════
+    // CLOSE-CONFIRMED BIAS INVALIDATION (latched)
+    // ═════════════════════════════════════════════════════════════════════
+    var bool   invalidated = false
+    var int    latchTf     = 0
+    var int    lastHIdAtInv = 0
+    var int    lastLIdAtInv = 0
+
+    int rawBias = hState == 1 and lState == 1 ? 1 : hState == -1 and lState == -1 ? -1 : 0
+
+    if useInv and not invalidated and rawBias != 0 and not na(lastH) and not na(lastL)
+        bool closeBelowLow  = rawBias == 1  and close < lastL
+        bool closeAboveHigh = rawBias == -1 and close > lastH
+        if closeBelowLow or closeAboveHigh
+            invalidated    := true
+            lastHIdAtInv   := hId
+            lastLIdAtInv   := lId
+
+    // Release the latch only when a NEW confirmed swing is available
+    if invalidated and (hId > lastHIdAtInv or lId > lastLIdAtInv)
+        invalidated := false
+        // If the fresh structure still has a direction, recompute below
+        rawBias := hState == 1 and lState == 1 ? 1 : hState == -1 and lState == -1 ? -1 : 0
+
+    int bias = na(prevH) or na(prevL) ? 99 : invalidated ? 0 : rawBias
+
+    // Every value is offset by [1] → only fully CLOSED bars are returned
+    [lastH[1], lastHT[1], hState[1], hId[1], lastL[1], lastLT[1], lState[1], lId[1], bias[1]]
+
+// ═══════════════════════════════════════════════════════════════════════
+// PER-TIMEFRAME REQUESTS (batched tuples, all offset by [1])
+// ═══════════════════════════════════════════════════════════════════════
+// 4H
+[h4P, h4T, h4S, h4Id, l4P, l4T, l4S, l4Id, b4] = request.security(syminfo.tickerid, "240",
+     f_structure(left4, right4), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+// 1H
+[h1P, h1T, h1S, h1Id, l1P, l1T, l1S, l1Id, b1] = request.security(syminfo.tickerid, "60",
+     f_structure(left1, right1), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+// 15m
+[h15P, h15T, h15S, h15Id, l15P, l15T, l15S, l15Id, b15] = request.security(syminfo.tickerid, "15",
+     f_structure(left15, right15), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+// 5m — same timeframe as chart, calculated locally with no extra delay
+[h5P, h5T, h5S, h5Id, l5P, l5T, l5S, l5Id, b5] = timeframe.period == "5" ?
+     f_structure(left5, right5) :
+     request.security(syminfo.tickerid, "5", f_structure(left5, right5),
+          gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════════════════════════════
+// SELECTED CHART-STRUCTURE TIMEFRAME (by input)
+// ═══════════════════════════════════════════════════════════════════════
+bool  isSel4H  = inputTF == "4H"
+bool  isSel1H  = inputTF == "1H"
+bool  isSel15m = inputTF == "15m"
+bool  isSel5m  = inputTF == "5m"
+
+float  sHP    = isSel4H ? h4P   : isSel1H ? h1P   : isSel15m ? h15P : h5P
+int    sHT    = isSel4H ? h4T   : isSel1H ? h1T   : isSel15m ? h15T : h5T
+int    sHS    = isSel4H ? h4S   : isSel1H ? h1S   : isSel15m ? h15S : h5S
+int    sHId   = isSel4H ? h4Id  : isSel1H ? h1Id  : isSel15m ? h15Id: h5Id
+float  sLP    = isSel4H ? l4P   : isSel1H ? l1P   : isSel15m ? l15P : l5P
+int    sLT    = isSel4H ? l4T   : isSel1H ? l1T   : isSel15m ? l15T : l5T
+int    sLS    = isSel4H ? l4S   : isSel1H ? l1S   : isSel15m ? l15S : l5S
+int    sLId   = isSel4H ? l4Id  : isSel1H ? l1Id  : isSel15m ? l15Id: l5Id
+int    sBias  = isSel4H ? b4    : isSel1H ? b1    : isSel15m ? b15  : b5
+string sName  = inputTF
+
+// ═══════════════════════════════════════════════════════════════════════
+// NEW-SWING EVENTS (detected once on the chart timeframe)
+// ═══════════════════════════════════════════════════════════════════════
+bool newHigh = nz(sHId) > 0 and nz(sHId) != nz(sHId[1])
+bool newLow  = nz(sLId) > 0 and nz(sLId) != nz(sLId[1])
+
+// ═══════════════════════════════════════════════════════════════════════
+// SWING LABELS (confirmation time, not pivot time)
+// ═══════════════════════════════════════════════════════════════════════
+if showSwings and newHigh and sHS != 0
+    string txt = sHS == 1 ? sName + " HH" : sHS == -1 ? sName + " LH" : sName + " EQH"
+    color  c   = sHS == 1 ? bullCol : sHS == -1 ? bearCol : neutCol
+    label.new(sHT, sHP, txt, xloc = xloc.bar_time, style = label.style_label_down,
+         color = c, textcolor = color.white, size = size.tiny,
+         tooltip = sName + " swing high\nPivot: " + str.format_time(sHT, "yyyy-MM-dd HH:mm") +
+                   "\nConfirmed: " + str.format_time(time, "yyyy-MM-dd HH:mm") +
+                   "\nFirst displayed: " + str.format_time(time, "yyyy-MM-dd HH:mm"))
+
+if showSwings and newLow and sLS != 0
+    string txt = sLS == 1 ? sName + " HL" : sLS == -1 ? sName + " LL" : sName + " EQL"
+    color  c   = sLS == 1 ? bullCol : sLS == -1 ? bearCol : neutCol
+    label.new(sLT, sLP, txt, xloc = xloc.bar_time, style = label.style_label_up,
+         color = c, textcolor = color.white, size = size.tiny,
+         tooltip = sName + " swing low\nPivot: " + str.format_time(sLT, "yyyy-MM-dd HH:mm") +
+                   "\nConfirmed: " + str.format_time(time, "yyyy-MM-dd HH:mm") +
+                   "\nFirst displayed: " + str.format_time(time, "yyyy-MM-dd HH:mm"))
+
+// Enforce configurable label-history limit: delete oldest only
+if array.size(labelPool) > labelCap
+    array.remove_label(labelPool, 0)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ACTIVE HIGH / LOW — two reusable rays, no price tags
+// ═══════════════════════════════════════════════════════════════════════
+var line  hiLine = na
+var line  loLine = na
+
+if showLevels and barstate.islast
+    if not na(sHP)
+        if na(hiLine)
+            hiLine := line.new(sHT, sHP, time, sHP, xloc = xloc.bar_time, extend = extend.right,
+                 color = hiLineCol, width = 1, style = line.style_dashed)
+        else
+            line.set_xy1(hiLine, sHT, sHP)
+            line.set_xy2(hiLine, time, sHP)
+    if not na(sLP)
+        if na(loLine)
+            loLine := line.new(sLT, sLP, time, sLP, xloc = xloc.bar_time, extend = extend.right,
+                 color = loLineCol, width = 1, style = line.style_dashed)
+        else
+            line.set_xy1(loLine, sLT, sLP)
+            line.set_xy2(loLine, time, sLP)
+
+// ═══════════════════════════════════════════════════════════════════════
+// OPTIONAL BIAS BACKGROUND SHADING (default OFF)
+// ═══════════════════════════════════════════════════════════════════════
+color shadeCol = sBias == 1 ? color.new(bullCol, 90) : sBias == -1 ? color.new(bearCol, 90) : na
+bgcolor(bgShade ? shadeCol : na)
+
+// ═══════════════════════════════════════════════════════════════════════
+// DASHBOARD (no prices, only structure and bias)
+// ═══════════════════════════════════════════════════════════════════════
+if showBias and barstate.islast
+    table.cell(dash, 0, 0, "TF",     text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "STRUCTURE", text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 2, 0, "BIAS",   text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+
+    // 4H row
+    string sH4 = h4S == 1 ? "HH" : h4S == -1 ? "LH" : h4S == 2 ? "EQH" : "—"
+    string sL4 = l4S == 1 ? "HL" : l4S == -1 ? "LL" : l4S == 2 ? "EQL" : "—"
+    string st4 = (h4S == 0 and l4S == 0) ? "WAIT" : sH4 + " / " + sL4
+    string bT4 = b4 == 1 ? "BULLISH" : b4 == -1 ? "BEARISH" : b4 == 99 ? "WAIT" : "UNCLEAR"
+    color  bC4 = b4 == 1 ? bullCol : b4 == -1 ? bearCol : neutCol
+    table.cell(dash, 0, 1, "4H",  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 1, 1, st4,  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 2, 1, bT4,  text_color = bC4,           text_size = txtSize, text_halign = text.align_left)
+
+    // 1H row
+    string sH1 = h1S == 1 ? "HH" : h1S == -1 ? "LH" : h1S == 2 ? "EQH" : "—"
+    string sL1 = l1S == 1 ? "HL" : l1S == -1 ? "LL" : l1S == 2 ? "EQL" : "—"
+    string st1 = (h1S == 0 and l1S == 0) ? "WAIT" : sH1 + " / " + sL1
+    string bT1 = b1 == 1 ? "BULLISH" : b1 == -1 ? "BEARISH" : b1 == 99 ? "WAIT" : "UNCLEAR"
+    color  bC1 = b1 == 1 ? bullCol : b1 == -1 ? bearCol : neutCol
+    table.cell(dash, 0, 2, "1H",  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 1, 2, st1,  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 2, 2, bT1,  text_color = bC1,           text_size = txtSize, text_halign = text.align_left)
+
+    // 15m row
+    string sH15 = h15S == 1 ? "HH" : h15S == -1 ? "LH" : h15S == 2 ? "EQH" : "—"
+    string sL15 = l15S == 1 ? "HL" : l15S == -1 ? "LL" : l15S == 2 ? "EQL" : "—"
+    string st15 = (h15S == 0 and l15S == 0) ? "WAIT" : sH15 + " / " + sL15
+    string bT15 = b15 == 1 ? "BULLISH" : b15 == -1 ? "BEARISH" : b15 == 99 ? "WAIT" : "UNCLEAR"
+    color  bC15 = b15 == 1 ? bullCol : b15 == -1 ? bearCol : neutCol
+    table.cell(dash, 0, 3, "15m",  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 1, 3, st15,  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 2, 3, bT15,  text_color = bC15,         text_size = txtSize, text_halign = text.align_left)
+
+    // 5m row
+    string sH5 = h5S == 1 ? "HH" : h5S == -1 ? "LH" : h5S == 2 ? "EQH" : "—"
+    string sL5 = l5S == 1 ? "HL" : l5S == -1 ? "LL" : l5S == 2 ? "EQL" : "—"
+    string st5 = (h5S == 0 and l5S == 0) ? "WAIT" : sH5 + " / " + sL5
+    string bT5 = b5 == 1 ? "BULLISH" : b5 == -1 ? "BEARISH" : b5 == 99 ? "WAIT" : "UNCLEAR"
+    color  bC5 = b5 == 1 ? bullCol : b5 == -1 ? bearCol : neutCol
+    table.cell(dash, 0, 4, "5m",  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 1, 4, st5,  text_color = color.white, text_size = txtSize, text_halign = text.align_left)
+    table.cell(dash, 2, 4, bT5,  text_color = bC5,           text_size = txtSize, text_halign = text.align_left)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS — bias change per timeframe, no repeats, no intrabar
+// ═══════════════════════════════════════════════════════════════════════
+alertcondition(b4  == 1  and nz(b4[1])  != 1,  "4H Bias → Bullish",  "4H bias turned BULLISH")
+alertcondition(b4  == -1 and nz(b4[1])  != -1, "4H Bias → Bearish",  "4H bias turned BEARISH")
+alertcondition(b1  == 1  and nz(b1[1])  != 1,  "1H Bias → Bullish",  "1H bias turned BULLISH")
+alertcondition(b1  == -1 and nz(b1[1])  != -1, "1H Bias → Bearish",  "1H bias turned BEARISH")
+alertcondition(b15 == 1  and nz(b15[1]) != 1,  "15m Bias → Bullish", "15m bias turned BULLISH")
+alertcondition(b15 == -1 and nz(b15[1]) != -1, "15m Bias → Bearish", "15m bias turned BEARISH")
+alertcondition(b5  == 1  and nz(b5[1])  != 1,  "5m Bias → Bullish",  "5m bias turned BULLISH")
+alertcondition(b5  == -1 and nz(b5[1])  != -1, "5m Bias → Bearish",  "5m bias turned BEARISH")
