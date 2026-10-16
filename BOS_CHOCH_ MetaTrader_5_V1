@@ -1,0 +1,206 @@
+//+------------------------------------------------------------------+
+//|                                                  BOS_CHOCH.mq5   |
+//|                                      Converted for MetaTrader 5  |
+//|                                        (Fixed for Live Market)   |
+//+------------------------------------------------------------------+
+#property copyright "Custom MT5 SMC Indicator"
+#property link      ""
+#property version   "1.10"
+#property indicator_chart_window
+#property indicator_buffers 0
+#property indicator_plots   0
+
+//--- Enums for Inputs
+enum ENUM_BREAK_TYPE {
+    BREAK_BODY = 0, // Body Close Break
+    BREAK_WICK = 1  // Wick (High/Low) Break
+};
+
+//--- Input Parameters
+input int               InpPivotLength = 5;               // Pivot Length (Left & Right)
+input ENUM_BREAK_TYPE   InpBreakType = BREAK_BODY;        // Break Confirmation
+input color             InpColorBull = clrSeaGreen;       // Bullish Color
+input color             InpColorBear = clrRed;            // Bearish Color
+input bool              InpShowLabels = true;             // Show Text Labels
+input bool              InpAlertBOS = true;               // Alert on BOS
+input bool              InpAlertCHoCH = true;             // Alert on CHoCH
+
+//--- Global Variables
+int    trend = 0; // 0 = Start, 1 = Bullish, -1 = Bearish
+double swingHighPrice = 0.0;
+datetime swingHighTime = 0;
+double swingLowPrice = 0.0;
+datetime swingLowTime = 0;
+
+datetime lastAlertTime = 0;
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Clean up old objects if indicator is loaded
+    ObjectsDeleteAll(0, "SMC_");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Clean up when indicator is removed
+    ObjectsDeleteAll(0, "SMC_");
+}
+
+//+------------------------------------------------------------------+
+//| Helper to Draw Lines and Labels                                  |
+//+------------------------------------------------------------------+
+void DrawStructure(datetime t1, double p1, datetime t2, color col, string text, bool isBearish)
+{
+    // FIX: Unique Name Generation based on Swing Time and Price (Never Overlaps)
+    string objName = "SMC_Line_" + text + "_" + IntegerToString(t1) + "_" + DoubleToString(p1, 5);
+    
+    // Draw Trend Line
+    if(ObjectCreate(0, objName, OBJ_TREND, 0, t1, p1, t2, p1)) 
+    {
+        ObjectSetInteger(0, objName, OBJPROP_COLOR, col);
+        ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
+        ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
+        ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+        ObjectSetInteger(0, objName, OBJPROP_BACK, false);
+    }
+    
+    if(InpShowLabels)
+    {
+        string lblName = "SMC_Lbl_" + text + "_" + IntegerToString(t1) + "_" + DoubleToString(p1, 5);
+        datetime midTime = t1 + (t2 - t1) / 2;
+        
+        if(ObjectCreate(0, lblName, OBJ_TEXT, 0, midTime, p1))
+        {
+            ObjectSetString(0, lblName, OBJPROP_TEXT, text);
+            ObjectSetInteger(0, lblName, OBJPROP_COLOR, col);
+            ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 8);
+            
+            if(isBearish)
+                ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_LOWER);
+            else
+                ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_UPPER);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+    // Ensure we have enough bars
+    if(rates_total < InpPivotLength * 2 + 1) return(0);
+    
+    // Set arrays as timeseries (index 0 is the oldest bar)
+    ArraySetAsSeries(time, false);
+    ArraySetAsSeries(open, false);
+    ArraySetAsSeries(high, false);
+    ArraySetAsSeries(low, false);
+    ArraySetAsSeries(close, false);
+
+    // FIX: Set correct limits to avoid "Array Out of Range" crashing the live feed
+    int limit = (prev_calculated == 0) ? (InpPivotLength * 2) : (prev_calculated - 1);
+
+    for(int i = limit; i < rates_total; i++) 
+    {
+        // 1. Detect Pivot High & Low (Checking the bar 'InpPivotLength' steps back to avoid future projection errors)
+        int pIndex = i - InpPivotLength;
+        if(pIndex < InpPivotLength) continue;
+
+        bool isPivotHigh = true;
+        bool isPivotLow = true;
+
+        for(int j = 1; j <= InpPivotLength; j++) 
+        {
+            if(high[pIndex] <= high[pIndex - j] || high[pIndex] <= high[pIndex + j]) isPivotHigh = false;
+            if(low[pIndex]  >= low[pIndex - j]  || low[pIndex]  >= low[pIndex + j])  isPivotLow = false;
+        }
+        
+        if(isPivotHigh) 
+        {
+            if(trend != 1 || high[pIndex] > swingHighPrice) {
+                swingHighPrice = high[pIndex];
+                swingHighTime = time[pIndex];
+            }
+        }
+
+        if(isPivotLow) 
+        {
+            if(trend != -1 || low[pIndex] < swingLowPrice) {
+                swingLowPrice = low[pIndex];
+                swingLowTime = time[pIndex];
+            }
+        }
+
+        // 2. Breakout Logic on Current Evaluated Bar
+        double currentHigh = (InpBreakType == BREAK_BODY) ? MathMax(close[i], open[i]) : high[i];
+        double currentLow  = (InpBreakType == BREAK_BODY) ? MathMin(close[i], open[i]) : low[i];
+        bool isLiveBar = (i == rates_total - 1);
+
+        // Bullish Break
+        if(swingHighPrice > 0 && currentHigh > swingHighPrice) 
+        {
+            if(trend == -1 || trend == 0) 
+            {
+                DrawStructure(swingHighTime, swingHighPrice, time[i], InpColorBull, "CHoCH", false);
+                trend = 1;
+                if(InpAlertCHoCH && isLiveBar && time[i] != lastAlertTime) {
+                    Alert(Symbol() + " Bullish CHoCH @ " + DoubleToString(swingHighPrice, _Digits));
+                    lastAlertTime = time[i];
+                }
+            } 
+            else if(trend == 1) 
+            {
+                DrawStructure(swingHighTime, swingHighPrice, time[i], InpColorBull, "BOS", false);
+                if(InpAlertBOS && isLiveBar && time[i] != lastAlertTime) {
+                    Alert(Symbol() + " Bullish BOS @ " + DoubleToString(swingHighPrice, _Digits));
+                    lastAlertTime = time[i];
+                }
+            }
+            swingHighPrice = 0.0; // Reset
+        }
+
+        // Bearish Break
+        if(swingLowPrice > 0 && currentLow < swingLowPrice) 
+        {
+            if(trend == 1 || trend == 0) 
+            {
+                DrawStructure(swingLowTime, swingLowPrice, time[i], InpColorBear, "CHoCH", true);
+                trend = -1;
+                if(InpAlertCHoCH && isLiveBar && time[i] != lastAlertTime) {
+                    Alert(Symbol() + " Bearish CHoCH @ " + DoubleToString(swingLowPrice, _Digits));
+                    lastAlertTime = time[i];
+                }
+            } 
+            else if(trend == -1) 
+            {
+                DrawStructure(swingLowTime, swingLowPrice, time[i], InpColorBear, "BOS", true);
+                if(InpAlertBOS && isLiveBar && time[i] != lastAlertTime) {
+                    Alert(Symbol() + " Bearish BOS @ " + DoubleToString(swingLowPrice, _Digits));
+                    lastAlertTime = time[i];
+                }
+            }
+            swingLowPrice = 0.0; // Reset
+        }
+    }
+
+    ChartRedraw(); // Force chart to update immediately on live ticks
+    return(rates_total);
+}
+//+------------------------------------------------------------------+
