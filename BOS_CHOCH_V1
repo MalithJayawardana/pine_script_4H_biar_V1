@@ -1,0 +1,195 @@
+//@version=6
+indicator('BOS & CHoCH Pro', overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+// ================= INPUTS =================
+gS = 'Structure'
+showInternal = input.bool(true, 'Show Internal Structure', group = gS)
+lenInternal  = input.int(5, 'Internal Pivot Length', minval = 2, group = gS)
+showSwing    = input.bool(true, 'Show Swing Structure', group = gS)
+lenSwing     = input.int(20, 'Swing Pivot Length', minval = 3, group = gS)
+breakMode    = input.string('Close', 'Break Type', options = ['Close', 'Wick'], group = gS)
+atrMult      = input.float(0.1, 'Min Break Distance (x ATR)', minval = 0.0, step = 0.05, group = gS)
+
+gV = 'Visuals'
+showLabels = input.bool(true, 'Show Labels', group = gV)
+lblSizeIn  = input.string('Tiny', 'Label Size', options = ['Tiny', 'Small', 'Normal'], group = gV)
+chochStyleIn = input.string('Dashed', 'CHoCH Line Style', options = ['Dashed', 'Dotted', 'Solid'], group = gV)
+maxStruct  = input.int(30, 'Max Structures Kept (per type)', minval = 1, maxval = 100, group = gV)
+colBull    = input.color(#089981, 'Bullish Color', group = gV)
+colBear    = input.color(#f23645, 'Bearish Color', group = gV)
+showBg     = input.bool(true, 'Trend Background Tint', group = gV)
+showTable  = input.bool(true, 'Show Trend Table', group = gV)
+
+gH = 'Higher Timeframe Filter'
+useHtf  = input.bool(true, 'Use HTF Trend (marks aligned signals with ✓)', group = gH)
+htfTf   = input.timeframe('D', 'HTF', group = gH)
+htfOnly = input.bool(false, 'Only show signals aligned with HTF', group = gH)
+
+gA = 'Alerts'
+alertOnBOS   = input.bool(true, 'Alert on BOS', group = gA)
+alertOnCHoCH = input.bool(true, 'Alert on CHoCH', group = gA)
+
+// ================= HELPERS =================
+lblSize = lblSizeIn == 'Tiny' ? size.tiny : lblSizeIn == 'Small' ? size.small : size.normal
+chochStyle = chochStyleIn == 'Dashed' ? line.style_dashed : chochStyleIn == 'Dotted' ? line.style_dotted : line.style_solid
+
+// Lightweight HTF trend (no drawings, so it can run inside request.security)
+f_htfTrend() =>
+    h = ta.pivothigh(high, 5, 5)
+    l = ta.pivotlow(low, 5, 5)
+    var float lastH = na
+    var float lastL = na
+    var int tr = 0
+    if not na(h)
+        lastH := h
+    if not na(l)
+        lastL := l
+    if not na(lastH) and close > lastH
+        tr := 1
+        lastH := na
+    if not na(lastL) and close < lastL
+        tr := -1
+        lastL := na
+    tr
+
+// [1] + lookahead_on = no repaint
+htfTrend = request.security(syminfo.tickerid, htfTf, f_htfTrend()[1], lookahead = barmerge.lookahead_on)
+
+// ================= STRUCTURE ENGINE =================
+f_structure(int len, bool active, bool isSwing, float atrV, int htfTr) =>
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+
+    var float hiP = na
+    var int hiI = na
+    var float loP = na
+    var int loI = na
+    var float protLow = na
+    var int protLowI = na
+    var float protHigh = na
+    var int protHighI = na
+    var int trend = 0
+    var lns = array.new<line>()
+    var lbls = array.new<label>()
+
+    // 1) Major swing tracking: only higher highs (bull) / lower lows (bear) replace the level
+    if not na(ph)
+        if trend >= 0
+            if na(hiP) or ph > hiP
+                hiP := ph
+                hiI := bar_index - len
+    if not na(pl)
+        if trend <= 0
+            if na(loP) or pl < loP
+                loP := pl
+                loI := bar_index - len
+
+    // 2) Ranges used to find the new protected low/high after a break
+    int startBull = trend == -1 ? protHighI : hiI
+    int startBear = trend == 1 ? protLowI : loI
+    int nBull = math.min(4999, math.max(1, bar_index - nz(startBull, bar_index) + 1))
+    int nBear = math.min(4999, math.max(1, bar_index - nz(startBear, bar_index) + 1))
+    float newProtLow = ta.lowest(low, nBull)
+    int newProtLowI = bar_index + ta.lowestbars(low, nBull)
+    float newProtHigh = ta.highest(high, nBear)
+    int newProtHighI = bar_index + ta.highestbars(high, nBear)
+
+    // 3) Break detection
+    bullSrc = breakMode == 'Wick' ? high : close
+    bearSrc = breakMode == 'Wick' ? low : close
+    minD = atrV * atrMult
+    hiBreak = not na(hiP) and bullSrc > hiP + minD
+    phBreak = not na(protHigh) and bullSrc > protHigh + minD
+    loBreak = not na(loP) and bearSrc < loP - minD
+    plBreak = not na(protLow) and bearSrc < protLow - minD
+
+    bool bullEv = false
+    bool bearEv = false
+    if trend == 1
+        bullEv := hiBreak
+        bearEv := plBreak
+    else if trend == -1
+        bullEv := phBreak
+        bearEv := loBreak
+    else
+        bullEv := hiBreak
+        bearEv := loBreak
+
+    // Same-bar double break -> candle direction decides
+    if bullEv and bearEv
+        if close >= open
+            bearEv := false
+        else
+            bullEv := false
+
+    // 4) Process confirmed events only (no repaint)
+    if barstate.isconfirmed
+        if bullEv
+            bool isCh = trend == -1
+            float lvl = isCh ? protHigh : hiP
+            int x1 = isCh ? protHighI : hiI
+            bool aligned = not useHtf or htfTr == 1
+            bool emit = active and trend != 0 and (not htfOnly or aligned)
+            if emit
+                string txt = (isCh ? 'CHoCH' : 'BOS') + (useHtf and aligned ? ' ✓' : '')
+                array.push(lns, line.new(x1, lvl, bar_index, lvl, color = colBull, style = isCh ? chochStyle : line.style_solid, width = isSwing ? 2 : 1))
+                if showLabels
+                    array.push(lbls, label.new(int(math.avg(x1, bar_index)), lvl, text = txt, style = label.style_label_down, color = color.new(color.white, 100), textcolor = colBull, size = lblSize))
+                if array.size(lns) > maxStruct
+                    line.delete(array.shift(lns))
+                if array.size(lbls) > maxStruct
+                    label.delete(array.shift(lbls))
+                if (isCh and alertOnCHoCH) or (not isCh and alertOnBOS)
+                    alert('Bullish ' + (isCh ? 'CHoCH' : 'BOS') + ' [' + (isSwing ? 'Swing' : 'Internal') + '] ' + syminfo.ticker + ' (' + timeframe.period + ') close ' + str.tostring(close, format.mintick) + ' | level ' + str.tostring(lvl, format.mintick) + ' | trend Bullish | HTF ' + (htfTr == 1 ? 'Bullish' : htfTr == -1 ? 'Bearish' : 'n/a'), alert.freq_once_per_bar_close)
+            trend := 1
+            protLow := newProtLow
+            protLowI := newProtLowI
+            protHigh := na
+            hiP := na
+            loP := na
+
+        else if bearEv
+            bool isCh = trend == 1
+            float lvl = isCh ? protLow : loP
+            int x1 = isCh ? protLowI : loI
+            bool aligned = not useHtf or htfTr == -1
+            bool emit = active and trend != 0 and (not htfOnly or aligned)
+            if emit
+                string txt = (isCh ? 'CHoCH' : 'BOS') + (useHtf and aligned ? ' ✓' : '')
+                array.push(lns, line.new(x1, lvl, bar_index, lvl, color = colBear, style = isCh ? chochStyle : line.style_solid, width = isSwing ? 2 : 1))
+                if showLabels
+                    array.push(lbls, label.new(int(math.avg(x1, bar_index)), lvl, text = txt, style = label.style_label_up, color = color.new(color.white, 100), textcolor = colBear, size = lblSize))
+                if array.size(lns) > maxStruct
+                    line.delete(array.shift(lns))
+                if array.size(lbls) > maxStruct
+                    label.delete(array.shift(lbls))
+                if (isCh and alertOnCHoCH) or (not isCh and alertOnBOS)
+                    alert('Bearish ' + (isCh ? 'CHoCH' : 'BOS') + ' [' + (isSwing ? 'Swing' : 'Internal') + '] ' + syminfo.ticker + ' (' + timeframe.period + ') close ' + str.tostring(close, format.mintick) + ' | level ' + str.tostring(lvl, format.mintick) + ' | trend Bearish | HTF ' + (htfTr == 1 ? 'Bullish' : htfTr == -1 ? 'Bearish' : 'n/a'), alert.freq_once_per_bar_close)
+            trend := -1
+            protHigh := newProtHigh
+            protHighI := newProtHighI
+            protLow := na
+            hiP := na
+            loP := na
+    trend
+
+// ================= RUN =================
+atrV = ta.atr(14)
+internalTrend = f_structure(lenInternal, showInternal, false, atrV, htfTrend)
+swingTrend = f_structure(lenSwing, showSwing, true, atrV, htfTrend)
+
+// ================= BACKGROUND + TABLE =================
+mainTrend = showSwing ? swingTrend : internalTrend
+bgcolor(showBg ? (mainTrend == 1 ? color.new(colBull, 92) : mainTrend == -1 ? color.new(colBear, 92) : na) : na)
+
+f_txt(int t) => t == 1 ? 'Bullish' : t == -1 ? 'Bearish' : 'Neutral'
+f_col(int t) => t == 1 ? colBull : t == -1 ? colBear : color.gray
+
+var tbl = table.new(position.top_right, 2, 3, border_width = 1)
+if showTable and barstate.islast
+    table.cell(tbl, 0, 0, 'Internal', text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(tbl, 1, 0, f_txt(internalTrend), text_color = color.white, bgcolor = f_col(internalTrend))
+    table.cell(tbl, 0, 1, 'Swing', text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(tbl, 1, 1, f_txt(swingTrend), text_color = color.white, bgcolor = f_col(swingTrend))
+    table.cell(tbl, 0, 2, 'HTF ' + htfTf, text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(tbl, 1, 2, useHtf ? f_txt(htfTrend) : 'Off', text_color = color.white, bgcolor = useHtf ? f_col(htfTrend) : color.gray)
